@@ -1003,12 +1003,50 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+# The chip generations that build the slab tables with a scatter-set rather
+# than a scatter-add. Both build the same table (see slab_scatter); which is
+# cheaper depends on where the compiler runs it. Generation 7 offloads the
+# scatter-add to the SparseCore, where it overlaps the activation
+# all-gather, and keeps a scatter-set on the TensorCore, where it costs about
+# three times as much. Generation 8 offloads neither, and on the TensorCore
+# the set costs about half the add, which has to read each destination
+# back. A generation not named here keeps the add until it is measured.
+SLAB_SCATTER_SET_GENERATIONS = frozenset({8})
+
+
+def slab_scatter_by_set(info=None):
+    """Whether this chip builds the slab tables with a scatter-set.
+
+    Read off the device record, as chip_generation is, so the caller answers
+    it once and hands the answer to both slab scatters.
+    """
+    return chip_generation(info) in SLAB_SCATTER_SET_GENERATIONS
+
+
+def slab_scatter(size, rows, values, *, by_set):
+    """`zeros([size]).at[rows]` <- `values`, the out-of-range rows dropped.
+
+    Every live row receives at most one routed pair and the destination
+    starts at zero, so the add and the set build the same bits, and `by_set`
+    picks whichever the chip builds faster (slab_scatter_by_set). They part
+    only where pairs collide: past the slab's end, where nothing reads, and
+    on a live row after an out-of-range expert id, which the add sums and the
+    set resolves to either pair -- shard_token_gather's clip is the backstop
+    for both.
+    """
+    slab = jnp.zeros((size,), values.dtype).at[rows]
+    if by_set:
+        return slab.set(values, mode="drop")
+    return slab.add(values, mode="drop")
+
+
+def shard_token_gather(routing, me, *, shard_stride, rows=None, by_set=False):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
     here when the caller does not hold it already; passing it in keeps both
-    slab scatters on one index.
+    slab scatters on one index. `by_set` is the scatter form, as
+    slab_scatter_by_set answers it for this chip.
 
     The scatter runs against this shard's slab alone rather than against the
     replicated ep-wide slab followed by a slice, which built seven eighths
@@ -1017,7 +1055,7 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     The kernel fetches an input row by this table value with bounds checks
     off, so the one index that reaches memory is clamped here rather than
     trusted. An expert id outside [0, e_total) would land two pairs on one
-    row and sum their token numbers; the acceptance check refuses a gating
+    row and corrupt its token number; the acceptance check refuses a gating
     width that could produce one, and this is the backstop for it. Clipped
     on BOTH sides, to the bounds gather_clamp_bounds names -- see there for
     why the upper one is floored at zero. build_routing_tables refuses T = 0
@@ -1038,9 +1076,7 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
         else rows
     )
     gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
-    )
+    scattered = slab_scatter(shard_stride, row, token_of_pair, by_set=by_set)
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 

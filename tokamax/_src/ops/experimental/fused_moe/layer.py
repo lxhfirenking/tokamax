@@ -47,6 +47,8 @@ from .host import (
     shard_push_tables_in_rows,
     shard_token_gather,
     shard_transport_tables_in_blocks,
+    slab_scatter,
+    slab_scatter_by_set,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -422,6 +424,10 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
     )
+    # The scatter form of both slab tables, read off the same device record
+    # as the kernel's VMEM budget. The mesh in the cache key below pins the
+    # chip, so the key stays exact with this in local_fn's closure.
+    slab_by_set = slab_scatter_by_set()
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -561,16 +567,21 @@ def fused_ep_moe_v2(
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
         # The two slab scatters and the activation all-gather are offloaded to
-        # the SAME SparseCore. Ordering the scatters behind the collective
-        # enqueues it 129 us earlier and costs them the cover they had; that
-        # trade measures +2.80% at 2048 local tokens and negative at every
-        # smaller shape, so it is taken only where the routing plan in front
-        # of the collective is longer than the scatters behind it. Same bits
-        # either way; only the queue moves.
+        # the SAME SparseCore, where the slabs are built with an add (see
+        # SLAB_SCATTER_SET_GENERATIONS). Ordering the scatters behind the
+        # collective enqueues it 129 us earlier and costs them the cover they
+        # had; that trade measures +2.80% at 2048 local tokens and negative at
+        # every smaller shape, so it is taken only where the routing plan in
+        # front of the collective is longer than the scatters behind it. Same
+        # bits either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
+            routing,
+            me,
+            shard_stride=ragged_stride,
+            rows=slab_row,
+            by_set=slab_by_set,
         )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
@@ -596,9 +607,12 @@ def fused_ep_moe_v2(
             scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
+                slab_scatter(
+                    scale_rows * HIDDEN_LANE_BLOCK,
+                    slab_row,
+                    scale_bits,
+                    by_set=slab_by_set,
+                ),
                 jnp.float32,
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:

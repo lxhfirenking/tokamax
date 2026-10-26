@@ -251,3 +251,81 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}"
         )
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("sharded", [False, True], ids=["replicated", "sharded"])
+def test_slab_scatter_set_builds_the_add_tables(
+    ep, t_local, g_local, topk, skew, sharded
+):
+    """Both slab tables come out of a scatter-set as they do of an add.
+
+    That is what lets the chip generation pick the form. Every live row takes
+    at most one pair and the slab starts at zero; the only rows the two forms
+    can disagree on are dropped or past the slab's last row, where the kernel
+    never reads.
+    """
+    idx, kwargs = _routing_inputs(ep, t_local, g_local, topk, skew=skew, seed=3)
+    whole = host.build_routing_tables(idx, **kwargs)
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    flat = np.asarray(idx)
+    counts = np.stack(
+        [
+            np.bincount(
+                flat[d * t_local : (d + 1) * t_local].reshape(-1), minlength=e_total
+            )
+            for d in range(ep)
+        ]
+    ).astype(np.int32)
+    # Row-scale bit patterns as the routing exchange carries them: one
+    # positive f32 per token, repeated over its selections.
+    rng = np.random.default_rng(4)
+    tokens = ep * t_local
+    scale_bits = jnp.asarray(
+        np.repeat((rng.random(tokens, dtype=np.float32) + 0.5).view(np.int32), topk)
+    )
+    scale_size = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
+
+    for me in range(ep):
+        plan = (
+            host.build_routing_tables_sharded(
+                idx,
+                jnp.int32(me),
+                all_gather_rows=lambda row: jnp.asarray(counts),
+                **kwargs,
+            )
+            if sharded
+            else whole
+        )
+        rows = host.local_slab_rows(plan, me, shard_stride=stride)
+        gather_add, gather_set = (
+            host.shard_token_gather(
+                plan, me, shard_stride=stride, rows=rows, by_set=by_set
+            )
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(gather_set),
+            np.asarray(gather_add),
+            err_msg=f"token-gather table, shard {me}",
+        )
+        scale_add, scale_set = (
+            host.slab_scatter(scale_size, rows, scale_bits, by_set=by_set)
+            for by_set in (False, True)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scale_set)[:stride],
+            np.asarray(scale_add)[:stride],
+            err_msg=f"activation-scale slab, shard {me}",
+        )
+
+
+@pytest.mark.parametrize("chip,by_set", [("TPU_7X", False), ("TPU_8I", True)])
+def test_slab_scatter_form_follows_the_generation(chip, by_set):
+    """v7x keeps the add its SparseCore takes; TPU8i builds with the set."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(getattr(pltpu.ChipVersion, chip), 1)
+    assert host.slab_scatter_by_set(info) is by_set
