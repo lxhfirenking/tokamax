@@ -592,13 +592,17 @@ def fused_ep_moe_v2(
         # rebase sent past the end lands on one of them instead of being
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
+        #
+        # A set rather than an add, as in shard_token_gather: the live rows
+        # are distinct and start at zero, and on TPU8i the set is the cheaper
+        # TensorCore scatter.
         if form.quantized_activations:
             scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
                 .at[slab_row]
-                .add(scale_bits, mode="drop"),
+                .set(scale_bits, mode="drop"),
                 jnp.float32,
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:

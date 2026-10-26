@@ -1017,7 +1017,7 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     The kernel fetches an input row by this table value with bounds checks
     off, so the one index that reaches memory is clamped here rather than
     trusted. An expert id outside [0, e_total) would land two pairs on one
-    row and sum their token numbers; the acceptance check refuses a gating
+    row and keep either token number; the acceptance check refuses a gating
     width that could produce one, and this is the backstop for it. Clipped
     on BOTH sides, to the bounds gather_clamp_bounds names -- see there for
     why the upper one is floored at zero. build_routing_tables refuses T = 0
@@ -1038,8 +1038,13 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
         else rows
     )
     gather_lo, gather_hi = gather_clamp_bounds(T)
+    # A set rather than an add. The table starts at zero and no two pairs
+    # share a live row, so the bits are the same; but on TPU8i, where XLA
+    # runs this scatter on the TensorCore, an add has to read each
+    # destination back first and costs twice the set. (v7x offloads a
+    # scatter-add to the SparseCore and not a scatter-set: a gen-8 choice.)
     scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
+        jnp.zeros((shard_stride,), jnp.int32).at[row].set(token_of_pair, mode="drop")
     )
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
