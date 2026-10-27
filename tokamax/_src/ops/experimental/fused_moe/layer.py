@@ -52,10 +52,13 @@ from .host import (
     weight_format_of_dtype,
 )
 from .kernel import (
+    SCALE_SLAB_WINDOW,
+    build_act_scale_slab,
     build_combine_kernel,
     build_fused_ep_moe_kernel,
     combine_step_tokens,
     rowquant_fp8,
+    scale_slab_fits,
 )
 from .router_ops import pallas_select
 from .token_parallel import TokenReplicaLayout
@@ -576,9 +579,16 @@ def fused_ep_moe_v2(
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
         # sentinel remains out of range and cannot write a live padding row.
+        token_gather_unpadded = token_gather
         token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
-        # The activation row scale, scattered onto the slab row each routed
-        # pair computes on. It exists only where the rows were quantized.
+        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        # The activation row scale of each slab row: the scale of the token
+        # the row computes. It exists only where the rows were quantized.
+        #
+        # Where the per-token scales fit in SMEM it is a lookup through the
+        # token-gather table over the shard's live rows (build_act_scale_slab):
+        # the same bits on every row a pair lands on, at a fraction of the
+        # scatter below, which walks every routed pair of every shard.
         #
         # The slab is built flat and handed over in the dense lane-block
         # view, which is the same bytes in the same order and so costs
@@ -596,7 +606,23 @@ def fused_ep_moe_v2(
         # A set rather than an add, as in shard_token_gather: the live rows
         # are distinct and start at zero, and on TPU8i the set is the cheaper
         # TensorCore scatter.
-        if form.quantized_activations:
+        if form.quantized_activations and scale_slab_fits(scale_bits_g.shape[0]):
+            scale_rows = act_scale_slab_rows(ragged_stride)
+            view_rows = scale_rows * HIDDEN_LANE_BLOCK
+            table_rows = align_up(ragged_stride, SCALE_SLAB_WINDOW)
+            slab_bits = build_act_scale_slab(
+                n_tokens=scale_bits_g.shape[0],
+                table_rows=table_rows,
+                out_rows=align_up(view_rows, SCALE_SLAB_WINDOW),
+            )(
+                expert_rows.sum(),
+                jnp.pad(token_gather_unpadded, (0, table_rows - ragged_stride)),
+                scale_bits_g,
+            )
+            scale_slab = lax.bitcast_convert_type(
+                slab_bits[:view_rows], jnp.float32
+            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+        elif form.quantized_activations:
             scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
@@ -607,7 +633,6 @@ def fused_ep_moe_v2(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
