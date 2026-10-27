@@ -46,7 +46,9 @@ from .host import (
     shard_expert_slabs,
     shard_push_tables_in_rows,
     shard_token_gather,
+    shard_token_gather_sorted,
     shard_transport_tables_in_blocks,
+    token_gather_sort_fits,
     token_gather_window_rows,
     weight_form,
     weight_format_of_dtype,
@@ -570,11 +572,26 @@ def fused_ep_moe_v2(
         # smaller shape, so it is taken only where the routing plan in front
         # of the collective is longer than the scatters behind it. Same bits
         # either way; only the queue moves.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
-            slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
+        #
+        # Where its keys fit, the token-gather table is a sort of the routed
+        # pairs rather than a scatter through slab_row (see
+        # shard_token_gather_sorted). With the scale slab built from that
+        # table, nothing reads slab_row any more and its per-pair plan pass
+        # drops out of the program as well.
+        if token_gather_sort_fits(T, topk, e_total=e_total, ep=ep):
+            sort_ids = pairs_g
+            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+                sort_ids, q_g = lax.optimization_barrier((sort_ids, q_g))
+            token_gather = shard_token_gather_sorted(
+                sort_ids, routing, me, e_total=e_total, ep=ep,
+                shard_stride=ragged_stride,
+            )
+        else:
+            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+                slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard

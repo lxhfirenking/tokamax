@@ -251,3 +251,54 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}"
         )
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="ep32_g16_t48")],
+)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_sorted_token_gather_is_the_scattered_one(
+    ep, t_local, g_local, topk, skew, seed
+):
+    """The sort build gives the scatter's table, from either plan builder.
+
+    Skewed routing is the case that matters: most runs are empty or odd, so
+    the padding elements the sort carries are live on some runs and not on
+    others.
+    """
+    idx, kwargs = _routing_inputs(ep, t_local, g_local, topk, skew=skew, seed=seed)
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    assert host.token_gather_sort_fits(
+        ep * t_local, topk, e_total=e_total, ep=ep
+    )
+    whole = host.build_routing_tables(idx, **kwargs)
+    flat = np.asarray(idx)
+    counts = jnp.asarray(
+        np.stack(
+            [
+                np.bincount(
+                    flat[d * t_local : (d + 1) * t_local].reshape(-1),
+                    minlength=e_total,
+                )
+                for d in range(ep)
+            ]
+        ).astype(np.int32)
+    )
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda row: counts, **kwargs
+        )
+        for routing in (whole, shard):
+            np.testing.assert_array_equal(
+                np.asarray(
+                    host.shard_token_gather_sorted(
+                        idx, routing, jnp.int32(me), e_total=e_total, ep=ep,
+                        shard_stride=stride,
+                    )
+                ),
+                np.asarray(host.shard_token_gather(routing, me, shard_stride=stride)),
+                err_msg=f"shard {me}",
+            )
